@@ -54,6 +54,9 @@ struct Config {
 bool isDriverConnected = false;
 unsigned long lastDriverCheckTime = 0;
 const unsigned long DRIVER_CHECK_INTERVAL = 5000; // 每5秒检查一次
+bool shouldReconnectWiFi = false;
+unsigned long reconnectStartTime = 0;
+const unsigned long RECONNECT_DELAY = 30000; // 30秒后关闭AP模式
 
 // 添加驱动板连接检测函数
 bool checkDriverConnection() {
@@ -184,7 +187,13 @@ bool connectWiFi() {
     return false;
   }
   
-  WiFi.mode(WIFI_STA);
+  // 如果当前是AP模式，使用AP+STA模式尝试连接
+  if (isAPMode) {
+    WiFi.mode(WIFI_AP_STA);
+  } else {
+    WiFi.mode(WIFI_STA);
+  }
+  
   WiFi.begin(wifiConfig.ssid, wifiConfig.password);
   
   int attempts = 0;
@@ -195,7 +204,12 @@ bool connectWiFi() {
   }
   
   if (WiFi.status() == WL_CONNECTED) {
-    isAPMode = false;
+    if (!isAPMode) {  // 如果不是从AP模式连接的，则设置为纯STA模式
+      WiFi.mode(WIFI_STA);
+    }
+    // 注意：如果是从AP模式连接的，我们保持AP+STA模式，直到计时器到期
+    // 这样用户可以继续使用AP模式访问设备，同时也可以通过新的IP地址访问
+    
     Serial.println("\nWiFi已连接");
     Serial.print("IP地址: ");
     Serial.println(WiFi.localIP());
@@ -228,7 +242,7 @@ void handleWiFiConfig() {
   if (server.method() == HTTP_POST) {
     if (server.hasArg("reset")) {
       clearWiFiConfig();
-      server.send(200, "text/html", "<html><body><h1>WiFi配置已重置</h1><p>设备将在3秒后重启...</p><script>setTimeout(function(){window.location.href='/';},3000);</script></body></html>");
+      server.send(200, "text/html; charset=UTF-8", "<html><head><meta charset='UTF-8'><meta name='viewport' content='width=device-width, initial-scale=1.0'></head><body><h1>WiFi配置已重置</h1><p>设备将在3秒后重启...</p><script>setTimeout(function(){window.location.href='/';},3000);</script></body></html>");
       delay(3000);
       ESP.restart();
       return;
@@ -243,13 +257,104 @@ void handleWiFiConfig() {
       wifiConfig.configured = true;
       saveWiFiConfig();
       
-      server.send(200, "text/html", "<html><body><h1>WiFi配置已保存</h1><p>设备将在3秒后重启...</p><script>setTimeout(function(){window.location.href='/';},3000);</script></body></html>");
-      delay(3000);
-      ESP.restart();
+      // 尝试连接新的WiFi
+      WiFi.mode(WIFI_AP_STA);
+      WiFi.begin(wifiConfig.ssid, wifiConfig.password);
+      
+      int attempts = 0;
+      bool connected = false;
+      while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+        delay(500);
+        attempts++;
+      }
+      
+      if (WiFi.status() == WL_CONNECTED) {
+        connected = true;
+      }
+      
+      String html = "<html><head>";
+      html += "<meta charset='UTF-8'>";
+      html += "<meta name='viewport' content='width=device-width, initial-scale=1.0'>";
+      html += "<style>";
+      html += "body{font-family:Arial,sans-serif;margin:20px;background:#f0f0f0;text-align:center;}";
+      html += ".container{max-width:400px;margin:0 auto;background:white;padding:20px;border-radius:10px;box-shadow:0 2px 5px rgba(0,0,0,0.1);}";
+      html += "h1{color:#4CAF50;}";
+      html += ".success{color:#4CAF50;font-weight:bold;}";
+      html += ".error{color:#f44336;font-weight:bold;}";
+      html += ".info-box{background:#e3f2fd;padding:15px;border-radius:5px;margin:15px 0;text-align:left;}";
+      html += ".countdown{font-size:24px;font-weight:bold;margin:15px 0;}";
+      html += ".btn{display:inline-block;background:#4CAF50;color:white;padding:10px 15px;text-decoration:none;border-radius:4px;margin:5px;font-weight:bold;cursor:pointer;}";
+      html += ".ip-box{background:#f5f5f5;border:2px dashed #2196F3;border-radius:8px;padding:15px;margin:15px 0;text-align:center;}";
+      html += ".ip-address{font-weight:bold;font-size:24px;color:#2196F3;margin:10px 0;display:block;}";
+      html += ".control-url{font-weight:bold;font-size:16px;color:#4CAF50;margin:10px 0;word-break:break-all;}";
+      html += ".note{font-size:14px;color:#f44336;font-weight:bold;margin-top:10px;}";
+      html += "</style>";
+      html += "</head><body>";
+      html += "<div class='container'>";
+      html += "<h1>WiFi配置已保存</h1>";
+      
+      if (connected) {
+        String ipAddress = WiFi.localIP().toString();
+        String controlUrl = "http://" + ipAddress + "/control";
+        
+        html += "<p class='success'>✓ 连接成功!</p>";
+        html += "<div class='info-box'>";
+        html += "<h2>连接信息</h2>";
+        html += "<p><strong>网络名称：</strong>" + String(wifiConfig.ssid) + "</p>";
+        
+        html += "<div class='ip-box'>";
+        html += "<p>请记住以下信息，设备重启后使用此地址访问控制面板：</p>";
+        html += "<span class='ip-address'>" + ipAddress + "</span>";
+        html += "<p>完整控制面板地址：</p>";
+        html += "<span class='control-url'>" + controlUrl + "</span>";
+        html += "<p class='note'>请手动记录此IP地址！</p>";
+        html += "</div>";
+        
+        html += "<div style='margin:15px 0;'>";
+        html += "<button class='btn' onclick='restartDevice()'>记住IP并重启设备</button>";
+        html += "</div>";
+        html += "</div>";
+        
+        // 添加JavaScript重启功能
+        html += "<script>";
+        html += "function restartDevice() {";
+        html += "  if(confirm('确定已记住IP地址 " + ipAddress + " 并重启设备？')) {";
+        html += "    window.location.href = '/restart';";
+        html += "  }";
+        html += "}";
+        html += "</script>";
+      } else {
+        html += "<p class='error'>✗ 连接失败</p>";
+        html += "<p>无法连接到WiFi网络，但配置已保存。</p>";
+        html += "<p>设备将重启并尝试重新连接。</p>";
+      }
+      
+      html += "<p>热点将在<span id='countdown'>30</span>秒后自动关闭</p>";
+      html += "<p>您可以继续使用热点访问设备，或者使用新的IP地址</p>";
+      html += "<script>";
+      html += "let seconds = 30;";
+      html += "const countdownEl = document.getElementById('countdown');";
+      html += "const interval = setInterval(() => {";
+      html += "  seconds--;";
+      html += "  countdownEl.textContent = seconds;";
+      html += "  if (seconds <= 0) {";
+      html += "    clearInterval(interval);";
+      html += "  }";
+      html += "}, 1000);";
+      html += "</script>";
+      html += "</div></body></html>";
+      
+      server.send(200, "text/html; charset=UTF-8", html);
+      
+      // 设置延迟关闭AP模式
+      shouldReconnectWiFi = true;
+      reconnectStartTime = millis();
+      return;
     }
   } else if (server.hasArg("scan")) {
     String networks = getWiFiScanResult();
-    server.send(200, "text/plain", networks);
+    server.send(200, "text/plain; charset=UTF-8", networks);
+    return;
   } else {
     String currentWiFiInfo = "";
     if (!isAPMode && WiFi.status() == WL_CONNECTED) {
@@ -357,7 +462,7 @@ void handleWiFiConfig() {
     html += "}";
     html += "</script>";
     html += "</body></html>";
-    server.send(200, "text/html", html);
+    server.send(200, "text/html; charset=UTF-8", html);
   }
 }
 
@@ -466,7 +571,7 @@ void handleHelp() {
   html += "</div>";
   
   html += "</div></body></html>";
-  server.send(200, "text/html", html);
+  server.send(200, "text/html; charset=UTF-8", html);
 }
 
 void setup() {
@@ -488,9 +593,11 @@ void setup() {
   loadConfig();
   loadWiFiConfig();
   
-  // 尝试连接WiFi
+  // 修改WiFi连接逻辑
   if (!connectWiFi()) {
     setupAP();
+  } else {
+    WiFi.mode(WIFI_STA);  // 如果直接连接成功，使用纯STA模式
   }
   
   // 初始化步进电机
@@ -499,12 +606,13 @@ void setup() {
   
   // 配置Web服务器路由
   server.on("/", HTTP_GET, handleRoot);
-  server.on("/control", HTTP_GET, handleControl);
+  server.on("/control", HTTP_ANY, handleControl);  // 修改为支持GET和POST
   server.on("/save", HTTP_GET, handleSave);
   server.on("/wifi", HTTP_ANY, handleWiFiConfig);
   server.on("/wifi-status", HTTP_GET, handleWiFiStatus);
   server.on("/help", HTTP_GET, handleHelp);  // 添加帮助页面路由
   server.on("/driver-status", HTTP_GET, handleDriverStatus);
+  server.on("/restart", HTTP_GET, handleRestart);  // 添加重启设备路由
   
   // Captive Portal相关路由
   server.on("/hotspot-detect.html", HTTP_GET, handleCaptivePortal);
@@ -513,7 +621,7 @@ void setup() {
   
   server.onNotFound([]() {
     server.sendHeader("Location", String("http://") + apIP.toString(), true);
-    server.send(302, "text/plain", "");
+    server.send(302, "text/plain; charset=UTF-8", "");
   });
   
   server.begin();
@@ -524,6 +632,19 @@ void loop() {
     dnsServer.processNextRequest();
   }
   server.handleClient();
+  
+  // 处理WiFi重连和AP模式延迟关闭
+  if (shouldReconnectWiFi && millis() - reconnectStartTime >= RECONNECT_DELAY) {
+    shouldReconnectWiFi = false;
+    Serial.println("延迟时间到，重启设备...");
+    ESP.restart();
+  }
+  
+  // 如果处于AP+STA模式且已连接WiFi，更新状态显示
+  if (isAPMode && WiFi.status() == WL_CONNECTED) {
+    // 已连接WiFi但仍处于AP模式，这是正常的过渡状态
+    // 不需要做任何特殊处理，等待定时器到期后重启
+  }
   
   if (stepper.distanceToGo() != 0) {
     stepper.run();
@@ -547,17 +668,28 @@ void handleWiFiStatus() {
   status += "\"ip\":\"" + WiFi.localIP().toString() + "\",";
   status += "\"rssi\":" + String(WiFi.RSSI());
   status += "}";
-  server.send(200, "application/json", status);
+  server.send(200, "application/json; charset=UTF-8", status);
 }
 
 void handleRoot() {
-  if (isAPMode) {
+  // 只有在纯AP模式下才重定向到WiFi配置页面
+  // 如果已经连接到WiFi（即使同时处于AP模式），则显示控制面板
+  if (isAPMode && WiFi.status() != WL_CONNECTED) {
     server.sendHeader("Location", "/wifi");
-    server.send(302, "text/plain", "");
+    server.send(302, "text/plain; charset=UTF-8", "");
     return;
   }
   
-  String html = "<html><head>"
+  // 直接重定向到控制面板
+  server.sendHeader("Location", "/control");
+  server.send(302, "text/plain; charset=UTF-8", "");
+}
+
+// 添加控制面板处理函数
+void handleControl() {
+  if (server.method() == HTTP_GET && !server.hasArg("cmd")) {
+    // 显示控制面板
+    String html = "<html><head>"
                 "<meta charset='UTF-8'>"
                 "<meta name='viewport' content='width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no'>"
                 "<title>步进电机控制面板</title>"
@@ -957,10 +1089,11 @@ void handleRoot() {
                 "}"
                 "</script>"
                 "</body></html>";
-  server.send(200, "text/html", html);
-}
-
-void handleControl() {
+    server.send(200, "text/html; charset=UTF-8", html);
+    return;
+  }
+  
+  // 处理控制命令
   String cmd = server.arg("cmd");
   int speed = server.arg("speed").toInt();
   String mode = server.arg("mode");
@@ -999,7 +1132,7 @@ void handleControl() {
     }
   }
   
-  server.send(200, "text/plain", "OK");
+  server.send(200, "text/plain; charset=UTF-8", "OK");
 }
 
 void handleSave() {
@@ -1014,17 +1147,54 @@ void handleSave() {
   config.speed = constrain(config.speed, MIN_SPEED_RPM, MAX_SPEED_RPM);
   
   saveConfig();
-  server.send(200, "text/plain", "OK");
+  server.send(200, "text/plain; charset=UTF-8", "OK");
 }
 
 // 添加处理Captive Portal的函数
 void handleCaptivePortal() {
   server.sendHeader("Location", String("http://") + apIP.toString() + "/wifi", true);
-  server.send(302, "text/plain", "");
+  server.send(302, "text/plain; charset=UTF-8", "");
 }
 
 // 添加获取驱动板状态的处理函数
 void handleDriverStatus() {
   String status = "{\"connected\":" + String(isDriverConnected ? "true" : "false") + "}";
-  server.send(200, "application/json", status);
+  server.send(200, "application/json; charset=UTF-8", status);
+}
+
+// 添加立即重启设备的处理函数
+void handleRestart() {
+  String html = "<html><head>";
+  html += "<meta charset='UTF-8'>";
+  html += "<meta name='viewport' content='width=device-width, initial-scale=1.0'>";
+  html += "<style>";
+  html += "body{font-family:Arial,sans-serif;margin:20px;background:#f0f0f0;text-align:center;}";
+  html += ".container{max-width:400px;margin:0 auto;background:white;padding:20px;border-radius:10px;box-shadow:0 2px 5px rgba(0,0,0,0.1);}";
+  html += "h1{color:#4CAF50;}";
+  html += ".info{color:#2196F3;font-weight:bold;}";
+  html += ".success{color:#4CAF50;font-weight:bold;}";
+  html += "</style>";
+  
+  html += "</head><body>";
+  html += "<div class='container'>";
+  html += "<h1>设备正在重启</h1>";
+  
+  if (isAPMode) {
+    html += "<p class='info'>AP热点模式将关闭</p>";
+  }
+  
+  if (WiFi.status() == WL_CONNECTED) {
+    html += "<p class='success'>WiFi已连接</p>";
+    html += "<p>请使用您复制的IP地址访问控制面板</p>";
+    html += "<p>IP地址: <strong>" + WiFi.localIP().toString() + "</strong></p>";
+  } else {
+    html += "<p>设备将尝试连接到已保存的WiFi网络</p>";
+    html += "<p>请稍后使用路由器分配的IP地址访问设备</p>";
+  }
+  
+  html += "</div></body></html>";
+  
+  server.send(200, "text/html; charset=UTF-8", html);
+  delay(1000);  // 给浏览器足够的时间接收响应
+  ESP.restart();
 }
